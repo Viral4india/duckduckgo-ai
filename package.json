@@ -5,7 +5,7 @@
   },
   "dependencies": {
     "hono": "^4.4.4",
-    "free-chatbot": "1.0.2 ",
+    "free-chatbot": "^1.0.2 "
     
   },
   "devDependencies": {

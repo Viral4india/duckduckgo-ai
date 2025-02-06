@@ -1,5 +1,5 @@
 name = "duckduckgo-ai"
 compatibility_date = "2023-12-01"
-
+node_compat = true
 [vars]
 apikey = "069e1b3d-4093-48a9-80a5-6ae9b5a0f4f0"

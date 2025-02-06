@@ -1,256 +1,152 @@
-import {Hono} from 'hono'
-import {z} from "zod";
-import {validator} from "hono/validator";
-import {OpenAIRequest, OpenAIResponse, OpenAIStreamResponse} from "./types";
-import {streamSSE} from 'hono/streaming'
-import {cors} from 'hono/cors'
-
-const headers = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
-  "Accept": "text/event-stream",
-  "Accept-Language": "de,en-US;q=0.7,en;q=0.3",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Referer": "https://duckduckgo.com/?q=DuckDuckGo&ia=chat",
-  "Content-Type": "application/json",
-  "Origin": "https://duckduckgo.com",
-  "Connection": "keep-alive",
-  "Cookie": "dcm=1; bg=-1",
-  "Sec-Fetch-Dest": "empty",
-  "Sec-Fetch-Mode": "cors",
-  "Sec-Fetch-Site": "same-origin",
-  "Pragma": "no-cache",
-  "TE": "trailers",
-  "x-vqd-accept": "1",
-  "cache-control": "no-store"
-}
-const statusURL = "https://duckduckgo.com/duckchat/v1/status"
-const chatURL = "https://duckduckgo.com/duckchat/v1/chat"
-const schema = z.object({
-  model: z.string().default("gpt-4o-mini"),
-  messages: z.array(z.object({
-    role: z.string(),
-    content: z.string()
-  })),
-  stream: z.boolean().optional()
-})
-
-const models = [
-  "gpt-4o-mini",
-  "claude-3-haiku-20240307",
-  "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
-  "mistralai/Mixtral-8x7B-Instruct-v0.1"
-]
+import { Hono } from 'hono'
+import { stream, streamText } from 'hono/stream'
+import { HTTPException } from 'hono/http-exception'
 
 const app = new Hono()
 
-app.use('/*', cors({
-  origin: "*",
-}))
+// Session storage (you might want to use a proper database in production)
+const sessions = new Map()
 
-const getXcqd4 = async function () {
-  const res = await fetch(statusURL, {
-    method: "GET",
-    headers: headers,
-  })
-  return res.headers.get("x-vqd-4")
+class DDGSChat {
+  constructor() {
+    this.impersonate = this.randomChoice([
+      'chrome_131', 'safari_ios_17.4.1', 'edge_131', 'firefox_133'
+    ])
+    this.impersonateOS = this.randomChoice([
+      'android', 'ios', 'macos', 'windows'
+    ])
+  }
+
+  randomChoice(arr) {
+    return arr[Math.floor(Math.random() * arr.length)]
+  }
+
+  async getVQD() {
+    const response = await fetch('https://duckduckgo.com/duckchat/v1/status', {
+      headers: { 'x-vqd-accept': '1' }
+    })
+    return response.headers.get('x-vqd-4') || ''
+  }
+
+  async chat(session, message, model = 'gpt-4o-mini', timeout = 30) {
+    try {
+      // Initialize or update session
+      if (!session.vqd) {
+        session.vqd = await this.getVQD()
+        session.messages = []
+        session.tokens = 0
+      }
+
+      // Add user message
+      session.messages.push({ role: 'user', content: message })
+      session.tokens += Math.ceil(message.length / 4)
+
+      // API request
+      const response = await fetch('https://duckduckgo.com/duckchat/v1/chat', {
+        method: 'POST',
+        headers: {
+          'x-vqd-4': session.vqd,
+          'content-type': 'application/json',
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0'
+        },
+        body: JSON.stringify({
+          model: this.modelMap(model),
+          messages: session.messages
+        }),
+        timeout
+      })
+
+      // Handle new VQD
+      session.vqd = response.headers.get('x-vqd-4') || session.vqd
+
+      // Process streaming response
+      const data = await response.text()
+      const results = []
+      const cleanData = data
+        .replace(/\[DONE\]LIMT_CVRSA\n/g, '')
+        .split('data:')
+        .filter(x => x.trim())
+
+      for (const chunk of cleanData) {
+        try {
+          const json = JSON.parse(chunk.trim())
+          if (json.message) results.push(json.message)
+          if (json.action === 'error') this.handleError(json)
+        } catch (e) {
+          console.error('Error parsing chunk:', chunk)
+        }
+      }
+
+      // Add assistant response
+      const fullResponse = results.join('')
+      session.messages.push({ role: 'assistant', content: fullResponse })
+      session.tokens += fullResponse.length
+
+      return fullResponse
+    } catch (error) {
+      console.error('Chat error:', error)
+      throw new HTTPException(500, { message: 'Chat processing failed' })
+    }
+  }
+
+  modelMap(model) {
+    const models = {
+      '1': 'gpt-4o-mini',
+      '2': 'claude-3-haiku-20240307',
+      '3': 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
+      '4': 'mistralai/Mixtral-8x7B-Instruct-v0.1'
+    }
+    return models[model] || models['1']
+  }
+
+  handleError(json) {
+    const errorMap = {
+      'ERR_CONVERSATION_LIMIT': { status: 429, message: 'Conversation limit reached' },
+      'ERR_RATELIMIT': { status: 429, message: 'Rate limit exceeded' },
+      'ERR_TIMEOUT': { status: 504, message: 'Request timeout' }
+    }
+    
+    const errorInfo = errorMap[json.type] || { status: 500, message: 'Unknown error' }
+    throw new HTTPException(errorInfo.status, { message: errorInfo.message })
+  }
 }
 
-app.get('/', (c) => {
-  return c.text('Hello Hono!')
-})
-app.get("/v1/models", (c) => {
-  const list = []
-  for (let model of models) {
-    list.push({
-      id: model,
-      object: "model",
-      "created": 1686935002,
-      "owned_by": "duckduckgo-ai",
-    })
-  }
-  return c.json({
-    "object": "list",
-    "data": list
-  })
-})
+// Chat endpoint
+app.post('/chat', async (c) => {
+  const { message, model = '1', sessionId } = await c.req.json()
+  const ddgs = new DDGSChat()
 
-
-app.post("/v1/chat/completions", validator('json', (value, c) => {
-  const parsed = schema.safeParse(value)
-  if (!parsed.success) {
-    return c.json({error: parsed.error.errors[0].message}, 400)
-  }
-  return parsed.data
-}), async (c) => {
-  // @ts-ignore
-  const apikey = c.env["apikey"] ?? ''
-  if (apikey) {
-    const authorization = c.req.header("Authorization")
-    if (!authorization) {
-      return c.json({"error": "authorization error"}, 401)
-    }
-    if (apikey !== authorization.substring(7)) {
-      return c.json({"error": "apikey error"}, 401)
-    }
+  // Session management
+  let session = sessions.get(sessionId) || { 
+    vqd: null,
+    messages: [],
+    tokens: 0,
+    created: Date.now()
   }
 
-
-  const params = await c.req.json<OpenAIRequest>()
-  const requestParams = {
-    "model": params.model,
-    "messages": []
-  }
-  const messages = []
-  if (params.messages.length > 0) {
-    const lastMessage = params.messages[params.messages.length - 1];
-    messages.push(lastMessage);
-  }
-  // @ts-ignore
-  requestParams["messages"] = messages
   try {
-    let x4 = c.req.header("x-vqd-4")
-    if (!x4) {
-      x4 = await getXcqd4() || ""
-    }
-    if (!x4) {
-      return c.json({error: "x-xqd-4 get error"}, 400)
-    }
-    const resp = await fetch(chatURL, {
-      method: "POST",
-      headers: {"x-vqd-4": x4, ...headers},
-      body: JSON.stringify(requestParams)
+    const response = await ddgs.chat(session, message, model)
+    
+    // Update session storage
+    const newSessionId = sessionId || crypto.randomUUID()
+    sessions.set(newSessionId, session)
+
+    return c.json({
+      response,
+      sessionId: newSessionId,
+      tokens: session.tokens,
+      timestamp: Date.now()
     })
 
-    if (!resp.ok) {
-      return c.json({"error": "api request error", "message": await resp.text()}, 400)
-    }
-    c.header("x-vqd-4", resp.headers.get("x-vqd-4") || "")
-    let responseContent = ""
-    if (params.stream) {
-      return streamSSE(c, async (stream) => {
-        if (!resp.body) {
-          return
-        }
-        const reader = resp.body.getReader();
-        let decoder = new TextDecoder();
-        let buffer = '';
-        try {
-          while (true) {
-            const {done, value} = await reader.read();
-            if (done) {
-              break;
-            }
-            buffer += decoder.decode(value, {stream: true});
-            const parts = buffer.split('\n');
-            buffer = parts.pop() || '';
-            for (let part of parts) {
-              let response = null;
-              part = part.substring(6)//remove data:
-              if (part === "[DONE]") {
-                const openAIResponse = {
-                  id: "chat-",
-                  object: "chat.completion",
-                  created: (new Date()).getTime(),
-                  model: params.model,
-                  choices: [
-                    {
-                      index: 0,
-                      finish_reason: "stop",
-                      content_filter_results: null,
-                      delta: {}
-                    }
-                  ],
-                  system_fingerprint: "fp_44709d6fcb"
-                }
-
-                await stream.writeSSE({
-                  data: JSON.stringify(openAIResponse),
-                });
-
-                await stream.writeSSE({
-                  data: "[DONE]"
-                });
-                return
-              }
-              try {
-                response = JSON.parse(part)
-              } catch {
-                console.log('response parse error')
-              }
-              if (response) {
-                const openAIResponse: OpenAIStreamResponse = {
-                  id: "chatcmpl-duckduck-ai",
-                  object: "chat.completion",
-                  created: (new Date()).getTime() / 1000,
-                  model: params.model,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        role: response["role"],
-                        content: response["message"]
-                      },
-                      finish_reason: null,
-                      content_filter_results: null,
-                    }
-                  ]
-                }
-
-                await stream.writeSSE({
-                  data: JSON.stringify(openAIResponse),
-                });
-              }
-            }
-          }
-        } catch (e) {
-          console.error("Error reading from SSE stream:", e);
-        } finally {
-          reader.releaseLock();
-        }
-      });
-    }
-    if (resp.body) {
-      const buffer = await resp.text()
-      const parts = buffer.split("\n\n")
-      for (let part of parts) {
-        part = part.substring(6)
-        if(part === "[DONE]"){
-          break;
-        }
-        try {
-          const parseJson = JSON.parse(part)
-          responseContent += parseJson["message"]??''
-        } catch {
-          console.log('parse error')
-        }
-      }
-      const response: OpenAIResponse = {
-        id: "chatcmpl-duckduck-ai",
-        object: "chat.completion",
-        created: (new Date()).getTime() / 1000,
-        model: params.model,
-        system_fingerprint: "fp_44709d6fcb",
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: responseContent,
-          },
-          logprobs: null,
-          finish_reason: "stop"
-        }],
-        usage: {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
-      }
-      return c.json(response)
-    }
-  } catch
-    (e) {
-    return c.json({error: e}, 400)
+  } catch (error) {
+    console.error('Endpoint error:', error)
+    return c.json({ error: error.message }, error.status || 500)
   }
-
 })
+
+// Example usage:
+// curl -X POST http://localhost:3000/chat \
+//   -H "Content-Type: application/json" \
+//   -d '{"message": "What is Hono?", "model": "1"}'
+
 export default app
